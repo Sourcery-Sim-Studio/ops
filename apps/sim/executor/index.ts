@@ -1,10 +1,7 @@
 import { BlockPathCalculator } from '@/lib/block-path-calculator'
 import { createLogger } from '@/lib/logs/console-logger'
 import type { BlockOutput } from '@/blocks/types'
-import type { SerializedBlock, SerializedWorkflow } from '@/serializer/types'
-import { useExecutionStore } from '@/stores/execution/store'
-import { useConsoleStore } from '@/stores/panel/console/store'
-import { useGeneralStore } from '@/stores/settings/general/store'
+import { BlockType } from '@/executor/consts'
 import {
   AgentBlockHandler,
   ApiBlockHandler,
@@ -17,11 +14,11 @@ import {
   ResponseBlockHandler,
   RouterBlockHandler,
   WorkflowBlockHandler,
-} from './handlers/index'
-import { LoopManager } from './loops'
-import { ParallelManager } from './parallels'
-import { PathTracker } from './path'
-import { InputResolver } from './resolver'
+} from '@/executor/handlers'
+import { LoopManager } from '@/executor/loops/loops'
+import { ParallelManager } from '@/executor/parallels/parallels'
+import { PathTracker } from '@/executor/path/path'
+import { InputResolver } from '@/executor/resolver/resolver'
 import type {
   BlockHandler,
   BlockLog,
@@ -29,8 +26,12 @@ import type {
   ExecutionResult,
   NormalizedBlockOutput,
   StreamingExecution,
-} from './types'
-import { streamingResponseFormatProcessor } from './utils'
+} from '@/executor/types'
+import { streamingResponseFormatProcessor } from '@/executor/utils'
+import type { SerializedBlock, SerializedWorkflow } from '@/serializer/types'
+import { useExecutionStore } from '@/stores/execution/store'
+import { useConsoleStore } from '@/stores/panel/console/store'
+import { useGeneralStore } from '@/stores/settings/general/store'
 
 const logger = createLogger('Executor')
 
@@ -84,6 +85,7 @@ export class Executor {
             selectedOutputIds?: string[]
             edges?: Array<{ source: string; target: string }>
             onStream?: (streamingExecution: StreamingExecution) => Promise<void>
+            executionId?: string
           }
         },
     private initialBlockStates: Record<string, BlockOutput> = {},
@@ -151,8 +153,8 @@ export class Executor {
       new EvaluatorBlockHandler(),
       new FunctionBlockHandler(),
       new ApiBlockHandler(),
-      new LoopBlockHandler(this.resolver),
-      new ParallelBlockHandler(this.resolver),
+      new LoopBlockHandler(this.resolver, this.pathTracker),
+      new ParallelBlockHandler(this.resolver, this.pathTracker),
       new ResponseBlockHandler(),
       new WorkflowBlockHandler(),
       new GenericBlockHandler(),
@@ -547,7 +549,7 @@ export class Executor {
    */
   private validateWorkflow(): void {
     const starterBlock = this.actualWorkflow.blocks.find(
-      (block) => block.metadata?.id === 'starter'
+      (block) => block.metadata?.id === BlockType.STARTER
     )
     if (!starterBlock || !starterBlock.enabled) {
       throw new Error('Workflow must have an enabled starter block')
@@ -651,7 +653,7 @@ export class Executor {
     }
 
     const starterBlock = this.actualWorkflow.blocks.find(
-      (block) => block.metadata?.id === 'starter'
+      (block) => block.metadata?.id === BlockType.STARTER
     )
     if (starterBlock) {
       // Initialize the starter block with the workflow input
@@ -997,7 +999,7 @@ export class Executor {
     // Check if this is a loop block
     const isLoopBlock = incomingConnections.some((conn) => {
       const sourceBlock = this.actualWorkflow.blocks.find((b) => b.id === conn.source)
-      return sourceBlock?.metadata?.id === 'loop'
+      return sourceBlock?.metadata?.id === BlockType.LOOP
     })
 
     if (isLoopBlock) {
@@ -1080,7 +1082,7 @@ export class Executor {
       // For condition blocks, check if this is the selected path
       if (conn.sourceHandle?.startsWith('condition-')) {
         const sourceBlock = this.actualWorkflow.blocks.find((b) => b.id === conn.source)
-        if (sourceBlock?.metadata?.id === 'condition') {
+        if (sourceBlock?.metadata?.id === BlockType.CONDITION) {
           const conditionId = conn.sourceHandle.replace('condition-', '')
           const selectedCondition = context.decisions.condition.get(conn.source)
 
@@ -1095,7 +1097,7 @@ export class Executor {
       }
 
       // For router blocks, check if this is the selected target
-      if (sourceBlock?.metadata?.id === 'router') {
+      if (sourceBlock?.metadata?.id === BlockType.ROUTER) {
         const selectedTarget = context.decisions.router.get(conn.source)
 
         // If source is executed and this is not the selected target, consider it met
@@ -1218,7 +1220,7 @@ export class Executor {
 
     // Special case for starter block - it's already been initialized in createExecutionContext
     // This ensures we don't re-execute the starter block and just return its existing state
-    if (block.metadata?.id === 'starter') {
+    if (block.metadata?.id === BlockType.STARTER) {
       const starterState = context.blockStates.get(actualBlockId)
       if (starterState) {
         return starterState.output as NormalizedBlockOutput
@@ -1242,7 +1244,9 @@ export class Executor {
 
       // Check if this block needs the starter block's output
       // This is especially relevant for API, function, and conditions that might reference <start.input>
-      const starterBlock = this.actualWorkflow.blocks.find((b) => b.metadata?.id === 'starter')
+      const starterBlock = this.actualWorkflow.blocks.find(
+        (b) => b.metadata?.id === BlockType.STARTER
+      )
       if (starterBlock) {
         const starterState = context.blockStates.get(starterBlock.id)
         if (!starterState) {
@@ -1344,8 +1348,9 @@ export class Executor {
 
         // Skip console logging for infrastructure blocks like loops and parallels
         // For streaming blocks, we'll add the console entry after stream processing
-        if (block.metadata?.id !== 'loop' && block.metadata?.id !== 'parallel') {
+        if (block.metadata?.id !== BlockType.LOOP && block.metadata?.id !== BlockType.PARALLEL) {
           addConsole({
+            input: blockLog.input,
             output: blockLog.output,
             success: true,
             durationMs: blockLog.durationMs,
@@ -1353,6 +1358,7 @@ export class Executor {
             endedAt: blockLog.endedAt,
             workflowId: context.workflowId,
             blockId: parallelInfo ? blockId : block.id,
+            executionId: this.contextExtensions.executionId,
             blockName: parallelInfo
               ? `${block.metadata?.name || 'Unnamed Block'} (iteration ${
                   parallelInfo.iterationIndex + 1
@@ -1412,8 +1418,9 @@ export class Executor {
       context.blockLogs.push(blockLog)
 
       // Skip console logging for infrastructure blocks like loops and parallels
-      if (block.metadata?.id !== 'loop' && block.metadata?.id !== 'parallel') {
+      if (block.metadata?.id !== BlockType.LOOP && block.metadata?.id !== BlockType.PARALLEL) {
         addConsole({
+          input: blockLog.input,
           output: blockLog.output,
           success: true,
           durationMs: blockLog.durationMs,
@@ -1421,6 +1428,7 @@ export class Executor {
           endedAt: blockLog.endedAt,
           workflowId: context.workflowId,
           blockId: parallelInfo ? blockId : block.id,
+          executionId: this.contextExtensions.executionId,
           blockName: parallelInfo
             ? `${block.metadata?.name || 'Unnamed Block'} (iteration ${
                 parallelInfo.iterationIndex + 1
@@ -1478,8 +1486,9 @@ export class Executor {
       context.blockLogs.push(blockLog)
 
       // Skip console logging for infrastructure blocks like loops and parallels
-      if (block.metadata?.id !== 'loop' && block.metadata?.id !== 'parallel') {
+      if (block.metadata?.id !== BlockType.LOOP && block.metadata?.id !== BlockType.PARALLEL) {
         addConsole({
+          input: blockLog.input,
           output: {},
           success: false,
           error:
@@ -1490,6 +1499,7 @@ export class Executor {
           endedAt: blockLog.endedAt,
           workflowId: context.workflowId,
           blockId: parallelInfo ? blockId : block.id,
+          executionId: this.contextExtensions.executionId,
           blockName: parallelInfo
             ? `${block.metadata?.name || 'Unnamed Block'} (iteration ${parallelInfo.iterationIndex + 1})`
             : block.metadata?.name || 'Unnamed Block',
@@ -1568,10 +1578,10 @@ export class Executor {
     // Skip for starter blocks which don't have error handles
     const block = this.actualWorkflow.blocks.find((b) => b.id === blockId)
     if (
-      block?.metadata?.id === 'starter' ||
-      block?.metadata?.id === 'condition' ||
-      block?.metadata?.id === 'loop' ||
-      block?.metadata?.id === 'parallel'
+      block?.metadata?.id === BlockType.STARTER ||
+      block?.metadata?.id === BlockType.CONDITION ||
+      block?.metadata?.id === BlockType.LOOP ||
+      block?.metadata?.id === BlockType.PARALLEL
     ) {
       return false
     }

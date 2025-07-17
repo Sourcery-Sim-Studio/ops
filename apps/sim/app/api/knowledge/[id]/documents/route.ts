@@ -1,9 +1,10 @@
 import crypto from 'node:crypto'
-import { and, desc, eq, inArray, isNull } from 'drizzle-orm'
+import { and, desc, eq, inArray, isNull, sql } from 'drizzle-orm'
 import { type NextRequest, NextResponse } from 'next/server'
 import { z } from 'zod'
 import { getSession } from '@/lib/auth'
 import { createLogger } from '@/lib/logs/console-logger'
+import { getUserId } from '@/app/api/auth/oauth/utils'
 import { db } from '@/db'
 import { document } from '@/db/schema'
 import { checkKnowledgeBaseAccess, processDocumentAsync } from '../../utils'
@@ -209,6 +210,9 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
 
     const url = new URL(req.url)
     const includeDisabled = url.searchParams.get('includeDisabled') === 'true'
+    const search = url.searchParams.get('search')
+    const limit = Number.parseInt(url.searchParams.get('limit') || '50')
+    const offset = Number.parseInt(url.searchParams.get('offset') || '0')
 
     // Build where conditions
     const whereConditions = [
@@ -220,6 +224,23 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
     if (!includeDisabled) {
       whereConditions.push(eq(document.enabled, true))
     }
+
+    // Add search condition if provided
+    if (search) {
+      whereConditions.push(
+        // Search in filename
+        sql`LOWER(${document.filename}) LIKE LOWER(${`%${search}%`})`
+      )
+    }
+
+    // Get total count for pagination
+    const totalResult = await db
+      .select({ count: sql<number>`COUNT(*)` })
+      .from(document)
+      .where(and(...whereConditions))
+
+    const total = totalResult[0]?.count || 0
+    const hasMore = offset + limit < total
 
     const documents = await db
       .select({
@@ -249,14 +270,24 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
       .from(document)
       .where(and(...whereConditions))
       .orderBy(desc(document.uploadedAt))
+      .limit(limit)
+      .offset(offset)
 
     logger.info(
-      `[${requestId}] Retrieved ${documents.length} documents for knowledge base ${knowledgeBaseId}`
+      `[${requestId}] Retrieved ${documents.length} documents (${offset}-${offset + documents.length} of ${total}) for knowledge base ${knowledgeBaseId}`
     )
 
     return NextResponse.json({
       success: true,
-      data: documents,
+      data: {
+        documents,
+        pagination: {
+          total,
+          limit,
+          offset,
+          hasMore,
+        },
+      },
     })
   } catch (error) {
     logger.error(`[${requestId}] Error fetching documents`, error)
@@ -269,13 +300,29 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
   const { id: knowledgeBaseId } = await params
 
   try {
-    const session = await getSession()
-    if (!session?.user?.id) {
-      logger.warn(`[${requestId}] Unauthorized document creation attempt`)
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    const body = await req.json()
+    const { workflowId } = body
+
+    logger.info(`[${requestId}] Knowledge base document creation request`, {
+      knowledgeBaseId,
+      workflowId,
+      hasWorkflowId: !!workflowId,
+      bodyKeys: Object.keys(body),
+    })
+
+    const userId = await getUserId(requestId, workflowId)
+
+    if (!userId) {
+      const errorMessage = workflowId ? 'Workflow not found' : 'Unauthorized'
+      const statusCode = workflowId ? 404 : 401
+      logger.warn(`[${requestId}] Authentication failed: ${errorMessage}`, {
+        workflowId,
+        hasWorkflowId: !!workflowId,
+      })
+      return NextResponse.json({ error: errorMessage }, { status: statusCode })
     }
 
-    const accessCheck = await checkKnowledgeBaseAccess(knowledgeBaseId, session.user.id)
+    const accessCheck = await checkKnowledgeBaseAccess(knowledgeBaseId, userId)
 
     if (!accessCheck.hasAccess) {
       if ('notFound' in accessCheck && accessCheck.notFound) {
@@ -283,12 +330,10 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
         return NextResponse.json({ error: 'Knowledge base not found' }, { status: 404 })
       }
       logger.warn(
-        `[${requestId}] User ${session.user.id} attempted to create document in unauthorized knowledge base ${knowledgeBaseId}`
+        `[${requestId}] User ${userId} attempted to create document in unauthorized knowledge base ${knowledgeBaseId}`
       )
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
-
-    const body = await req.json()
 
     // Check if this is a bulk operation
     if (body.bulk === true) {

@@ -2,13 +2,19 @@ import { env } from '@/lib/env'
 import { createLogger } from '@/lib/logs/console-logger'
 import { getAllBlocks } from '@/blocks'
 import type { BlockOutput } from '@/blocks/types'
+import { BlockType } from '@/executor/consts'
+import type {
+  AgentInputs,
+  Message,
+  StreamingConfig,
+  ToolInput,
+} from '@/executor/handlers/agent/types'
+import type { BlockHandler, ExecutionContext, StreamingExecution } from '@/executor/types'
 import { executeProviderRequest } from '@/providers'
 import { getApiKey, getProviderFromModel, transformBlockTool } from '@/providers/utils'
 import type { SerializedBlock } from '@/serializer/types'
 import { executeTool } from '@/tools'
 import { getTool, getToolAsync } from '@/tools/utils'
-import type { BlockHandler, ExecutionContext, StreamingExecution } from '../../types'
-import type { AgentInputs, Message, StreamingConfig, ToolInput } from './types'
 
 const logger = createLogger('AgentBlockHandler')
 
@@ -22,7 +28,7 @@ const CUSTOM_TOOL_PREFIX = 'custom_'
  */
 export class AgentBlockHandler implements BlockHandler {
   canHandle(block: SerializedBlock): boolean {
-    return block.metadata?.id === 'agent'
+    return block.metadata?.id === BlockType.AGENT
   }
 
   async execute(
@@ -128,7 +134,7 @@ export class AgentBlockHandler implements BlockHandler {
         })
         .map(async (tool) => {
           if (tool.type === 'custom-tool' && tool.schema) {
-            return this.createCustomTool(tool, context)
+            return await this.createCustomTool(tool, context)
           }
           return this.transformBlockTool(tool, context)
         })
@@ -139,26 +145,36 @@ export class AgentBlockHandler implements BlockHandler {
     )
   }
 
-  private createCustomTool(tool: ToolInput, context: ExecutionContext): any {
+  private async createCustomTool(tool: ToolInput, context: ExecutionContext): Promise<any> {
+    const userProvidedParams = tool.params || {}
+
+    // Import the utility function
+    const { filterSchemaForLLM, mergeToolParameters } = await import('../../../tools/params')
+
+    // Create schema excluding user-provided parameters
+    const filteredSchema = filterSchemaForLLM(tool.schema.function.parameters, userProvidedParams)
+
+    const toolId = `${CUSTOM_TOOL_PREFIX}${tool.title}`
     const base: any = {
-      id: `${CUSTOM_TOOL_PREFIX}${tool.title}`,
+      id: toolId,
       name: tool.schema.function.name,
       description: tool.schema.function.description || '',
-      params: tool.params || {},
+      params: userProvidedParams,
       parameters: {
+        ...filteredSchema,
         type: tool.schema.function.parameters.type,
-        properties: tool.schema.function.parameters.properties,
-        required: tool.schema.function.parameters.required || [],
       },
       usageControl: tool.usageControl || 'auto',
     }
 
     if (tool.code) {
       base.executeFunction = async (callParams: Record<string, any>) => {
+        // Merge user-provided parameters with LLM-generated parameters
+        const mergedParams = mergeToolParameters(userProvidedParams, callParams)
+
         const result = await executeTool('function_execute', {
           code: tool.code,
-          ...tool.params,
-          ...callParams,
+          ...mergedParams,
           timeout: tool.timeout ?? DEFAULT_FUNCTION_TIMEOUT,
           envVars: context.environmentVariables || {},
           isCustomTool: true,
@@ -753,13 +769,16 @@ export class AgentBlockHandler implements BlockHandler {
   }
 
   private formatToolCall(tc: any) {
+    const toolName = this.stripCustomToolPrefix(tc.name)
+
     return {
       ...tc,
-      name: this.stripCustomToolPrefix(tc.name),
+      name: toolName,
       startTime: tc.startTime,
       endTime: tc.endTime,
       duration: tc.duration,
-      input: tc.arguments || tc.input,
+      arguments: tc.arguments || tc.input || {},
+      input: tc.arguments || tc.input || {}, // Keep both for backward compatibility
       output: tc.result || tc.output,
     }
   }
